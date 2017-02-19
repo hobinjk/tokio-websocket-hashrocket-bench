@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["hobinjk <hobinjk@mit.edu>"]
 
 [dependencies]
-websocket = { path = "../websocket" }
+websocket = { git = "https://github.com/hobinjk/tokio-websocket" }
 futures = "0.1"
 serde_json = "0.9"
 tokio-core = "0.1"
