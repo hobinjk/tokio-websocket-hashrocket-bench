@@ -8,3 +8,4 @@ websocket = { git = "https://github.com/hobinjk/tokio-websocket" }
 futures = "0.1"
 serde_json = "0.9"
 tokio-core = "0.1"
+net2 = "0.2"
