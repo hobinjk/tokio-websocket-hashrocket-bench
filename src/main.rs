@@ -1,5 +1,6 @@
 extern crate futures;
 extern crate tokio_core;
+extern crate tokio_io;
 extern crate websocket;
 extern crate serde_json;
 extern crate net2;
@@ -9,12 +10,12 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::io::{Error, ErrorKind, Result};
-use std::net::SocketAddr;
+use std::net::{self, SocketAddr};
 use std::thread;
 
-use tokio_core::net::{TcpListener, TcpStream};
+use tokio_core::net::TcpStream;
 use tokio_core::reactor::{Core, Handle};
-use tokio_core::io::Io;
+use tokio_io::AsyncRead;
 
 use net2::unix::UnixTcpBuilderExt;
 
@@ -55,7 +56,7 @@ fn process_frame(frame: Frame) -> Message {
     Message::None()
 }
 
-fn listener(addr: &SocketAddr, handle: &Handle) -> Result<TcpListener> {
+fn listener(addr: &SocketAddr) -> Result<net::TcpListener> {
     let listener = match *addr {
         SocketAddr::V4(_) => try!(net2::TcpBuilder::new_v4()),
         SocketAddr::V6(_) => try!(net2::TcpBuilder::new_v6()),
@@ -63,14 +64,13 @@ fn listener(addr: &SocketAddr, handle: &Handle) -> Result<TcpListener> {
     try!(listener.reuse_port(true));
     try!(listener.reuse_address(true));
     try!(listener.bind(addr));
-    listener.listen(32).and_then(|l| {
-        TcpListener::from_listener(l, addr, handle)
-    })
+    listener.listen(32)
 }
 
 type Connections = Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Frame>>>>;
 
-fn serve_one(handle: &Handle, connections: &Connections, conn: TcpStream, addr: SocketAddr) -> Result<()> {
+fn serve_one(handle: &Handle, connections: &Connections, conn: net::TcpStream, addr: SocketAddr) -> Result<()> {
+    let conn = TcpStream::from_stream(conn, handle).unwrap();
     let (sink, stream) = conn.framed(WebSocketCodec::new()).split();
     let (tx, rx) = mpsc::unbounded();
 
@@ -84,16 +84,15 @@ fn serve_one(handle: &Handle, connections: &Connections, conn: TcpStream, addr: 
                     Message::None() => {},
                     Message::Echo(frame) => {
                         if frame.header.opcode == Opcode::Close {
-                            let mut conns = connections_inner.write().unwrap();
-                            conns.remove(&addr);
+                            connections_inner.write().unwrap().remove(&addr);
                             return Err(Error::new(ErrorKind::Other, "close requested"))
                         }
                         let masked_frame = new_text_frame(&frame.payload_string().unwrap(), None);
                         mpsc::UnboundedSender::send(&tx, masked_frame).unwrap();
                     },
                     Message::Broadcast(broadcast_frame, echo_frame) => {
-                        let conns = connections_inner.read().unwrap();
                         let masked_frame = new_text_frame(&broadcast_frame.payload_string().unwrap(), None);
+                        let conns = connections_inner.read().unwrap();
                         for (&t_addr, tx) in conns.iter() {
                             mpsc::UnboundedSender::send(&tx, masked_frame.clone()).unwrap();
                             if addr == t_addr {
@@ -122,7 +121,7 @@ fn serve_one(handle: &Handle, connections: &Connections, conn: TcpStream, addr: 
     Ok(())
 }
 
-fn serve(incoming: mpsc::UnboundedReceiver<(TcpStream, SocketAddr)>, connections: &Connections) {
+fn serve(incoming: mpsc::UnboundedReceiver<(net::TcpStream, SocketAddr)>, connections: &Connections) {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
 
@@ -134,11 +133,10 @@ fn serve(incoming: mpsc::UnboundedReceiver<(TcpStream, SocketAddr)>, connections
 }
 
 fn main() {
-    let mut core = Core::new().unwrap();
-    let handle = core.handle();
     // Set up using skeleton of chat example, use encode and decode directly
     let addr = "0.0.0.0:8084".parse().unwrap();
-    let socket = listener(&addr, &handle).unwrap();
+
+    let socket = listener(&addr).unwrap();
 
     let connections = Arc::new(RwLock::new(HashMap::new()));
 
@@ -155,15 +153,20 @@ fn main() {
     }).collect::<Vec<_>>();
 
     let mut i = 0;
-    let srv = socket.incoming().for_each(move |conn| {
-        mpsc::UnboundedSender::send(&incomings[i], conn).unwrap();
-        i += 1;
-        if i >= incomings.len() {
-            i = 0;
+    for conn in socket.incoming() {
+        match conn {
+            Ok(conn) => {
+                let addr = conn.peer_addr().unwrap();
+                mpsc::UnboundedSender::send(&incomings[i], (conn, addr)).unwrap();
+                i += 1;
+                if i >= incomings.len() {
+                    i = 0;
+                }
+            },
+            Err(_) => {
+            }
         }
-        Ok(())
-    });
-    core.run(srv).unwrap();
+    }
 
     for thread in threads {
         thread.join().unwrap();
